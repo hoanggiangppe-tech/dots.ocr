@@ -90,7 +90,7 @@ def parse_server_url(server_url):
     return protocol, ip, port
 
 
-def build_parser(server_url, model_name, temperature):
+def build_parser(server_url, model_name, temperature, dpi=150):
     protocol, ip, port = parse_server_url(server_url)
     return DotsOCRParser(
         protocol=protocol,
@@ -98,7 +98,7 @@ def build_parser(server_url, model_name, temperature):
         port=int(port),
         model_name=model_name,
         temperature=float(temperature),
-        dpi=200,
+        dpi=int(dpi),
         output_dir=tempfile.mkdtemp(prefix="dotsocr_"),
     )
 
@@ -147,7 +147,7 @@ def navigate(direction, state):
 
 
 def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
-              server_url, model_name, min_px, max_px, state):
+              server_url, model_name, dpi, min_px, max_px, state):
 
     path = file_input or demo_file
     if not path or not os.path.exists(str(path)):
@@ -172,7 +172,7 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
         dict_promptmode_to_prompt["prompt_general"] = custom_prompt.strip()
 
     try:
-        parser = build_parser(server_url, model_name, temperature)
+        parser = build_parser(server_url, model_name, temperature, dpi)
         parser.min_pixels = int(min_px) if min_px else None
         parser.max_pixels = int(max_px) if max_px else None
 
@@ -350,6 +350,11 @@ with gr.Blocks(title="dots.ocr") as demo:
                 model_name = gr.Textbox(label="Model name", value="model")
 
             with gr.Accordion("🔧 Advanced", open=False):
+                dpi = gr.Slider(
+                    label="PDF render DPI",
+                    minimum=72, maximum=200, step=1, value=150,
+                    info="Giảm DPI nếu bị lỗi MemoryError với PDF lớn (150→100→72)",
+                )
                 min_px = gr.Number(label="Min pixels", value=MIN_PIXELS, precision=0)
                 max_px = gr.Number(label="Max pixels", value=MAX_PIXELS, precision=0)
 
@@ -419,7 +424,7 @@ with gr.Blocks(title="dots.ocr") as demo:
     parse_btn.click(
         run_parse,
         inputs=[file_input, demo_file, prompt_mode, custom_prompt,
-                server_url, model_name, min_px, max_px, state],
+                server_url, model_name, dpi, min_px, max_px, state],
         outputs=[preview_img, info_md, md_rendered, md_raw,
                  download_btn, page_info, json_out, state],
     )
