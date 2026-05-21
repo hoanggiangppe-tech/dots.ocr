@@ -10,6 +10,7 @@ import tempfile
 import uuid
 import zipfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 import gradio as gr
 from PIL import Image
@@ -73,8 +74,26 @@ def make_session():
     }
 
 
-def build_parser(ip, port, model_name, temperature):
+def parse_server_url(server_url):
+    """Accept either a full URL (https://xxx.ngrok.io) or plain IP."""
+    server_url = server_url.strip().rstrip("/")
+    if server_url.startswith("http"):
+        p = urlparse(server_url)
+        protocol = p.scheme
+        ip = p.hostname
+        port = p.port or (443 if protocol == "https" else 80)
+    else:
+        # plain IP or host
+        protocol = "http"
+        ip = server_url
+        port = 8000
+    return protocol, ip, port
+
+
+def build_parser(server_url, model_name, temperature):
+    protocol, ip, port = parse_server_url(server_url)
     return DotsOCRParser(
+        protocol=protocol,
         ip=ip,
         port=int(port),
         model_name=model_name,
@@ -128,7 +147,7 @@ def navigate(direction, state):
 
 
 def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
-              ip, port, model_name, min_px, max_px, state):
+              server_url, model_name, min_px, max_px, state):
 
     path = file_input or demo_file
     if not path or not os.path.exists(str(path)):
@@ -153,7 +172,7 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
         dict_promptmode_to_prompt["prompt_general"] = custom_prompt.strip()
 
     try:
-        parser = build_parser(ip, port, model_name, temperature)
+        parser = build_parser(server_url, model_name, temperature)
         parser.min_pixels = int(min_px) if min_px else None
         parser.max_pixels = int(max_px) if max_px else None
 
@@ -201,7 +220,7 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
             f"**File:** `{Path(path).name}`  \n"
             f"**Pages:** {len(results)}  |  "
             f"**Elements:** {len(all_cells)}  |  "
-            f"**Model:** `{model_name}` @ `{ip}:{port}`  \n"
+            f"**Model:** `{model_name}` @ `{server_url}`  \n"
             f"**Prompt:** `{prompt_mode}`"
         )
 
@@ -225,12 +244,12 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
         err = str(exc)
         if "Connection refused" in err or "connect" in err.lower():
             msg = (
-                f"⚠️ **Cannot connect to vLLM server** at `{ip}:{port}`\n\n"
-                "Please start the server first:\n"
+                f"⚠️ **Cannot connect to server** at `{server_url}`\n\n"
+                "**Nếu dùng Colab:** Hãy chắc chắn notebook Colab đang chạy và dán đúng ngrok URL.\n\n"
+                "**Nếu chạy local:** Start vLLM server trước:\n"
                 "```bash\n"
                 f"vllm serve ./weights/DotsOCR \\\n"
                 f"    --tensor-parallel-size 1 \\\n"
-                f"    --gpu-memory-utilization 0.9 \\\n"
                 f"    --served-model-name {model_name} \\\n"
                 f"    --trust-remote-code\n"
                 "```"
@@ -322,10 +341,13 @@ with gr.Blocks(title="dots.ocr") as demo:
                 parse_btn = gr.Button("🔍 Parse", variant="primary", elem_id="parse-btn", scale=3)
                 clear_btn = gr.Button("🗑️ Clear", scale=1)
 
-            with gr.Accordion("🌐 Server Config", open=False):
-                server_ip   = gr.Textbox(label="vLLM Server IP",   value="127.0.0.1")
-                server_port = gr.Number(label="Port",              value=8000, precision=0)
-                model_name  = gr.Textbox(label="Model name",       value="model")
+            with gr.Accordion("🌐 Server Config", open=True):
+                server_url = gr.Textbox(
+                    label="Server URL",
+                    value="http://127.0.0.1:8000",
+                    info="Local: http://127.0.0.1:8000  |  Colab/ngrok: https://xxxx.ngrok-free.app",
+                )
+                model_name = gr.Textbox(label="Model name", value="model")
 
             with gr.Accordion("🔧 Advanced", open=False):
                 min_px = gr.Number(label="Min pixels", value=MIN_PIXELS, precision=0)
@@ -397,7 +419,7 @@ with gr.Blocks(title="dots.ocr") as demo:
     parse_btn.click(
         run_parse,
         inputs=[file_input, demo_file, prompt_mode, custom_prompt,
-                server_ip, server_port, model_name, min_px, max_px, state],
+                server_url, model_name, min_px, max_px, state],
         outputs=[preview_img, info_md, md_rendered, md_raw,
                  download_btn, page_info, json_out, state],
     )
