@@ -147,7 +147,7 @@ def navigate(direction, state):
 
 
 def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
-              server_url, model_name, dpi, min_px, max_px, state):
+              server_url, model_name, dpi, page_from, page_to, min_px, max_px, state):
 
     path = file_input or demo_file
     if not path or not os.path.exists(str(path)):
@@ -166,7 +166,6 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
     temperature = PROMPT_TEMP.get(prompt_mode, 0.1)
     fitz_pre    = PROMPT_FITZ.get(prompt_mode, True)
 
-    # Patch prompt_general with user text
     _original_general = dict_promptmode_to_prompt.get("prompt_general", " ")
     if prompt_mode == "prompt_general" and custom_prompt.strip():
         dict_promptmode_to_prompt["prompt_general"] = custom_prompt.strip()
@@ -180,7 +179,26 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
         fname = Path(path).stem
 
         if ext == ".pdf":
-            results = parser.parse_pdf(path, fname, prompt_mode, temp_dir)
+            # Load page by page to avoid bulk memory usage
+            start = max(0, int(page_from) - 1)
+            end   = int(page_to) - 1 if page_to else None
+            try:
+                pages = load_images_from_pdf(path, dpi=int(dpi),
+                                             start_page_id=start, end_page_id=end)
+            except Exception as mem_exc:
+                if "malloc" in str(mem_exc) or "MemoryError" in str(type(mem_exc)):
+                    raise MemoryError(str(mem_exc))
+                raise
+
+            results = []
+            for i, img in enumerate(pages):
+                page_no = start + i
+                r = parser._parse_single_image(
+                    img, prompt_mode, temp_dir,
+                    fname, source="pdf", page_idx=page_no,
+                )
+                r["file_path"] = path
+                results.append(r)
         else:
             results = parser.parse_image(path, fname, prompt_mode, temp_dir,
                                          fitz_preprocess=fitz_pre)
@@ -216,15 +234,15 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
         first_img = first["layout_image"] or (Image.open(path) if ext != ".pdf" else state["pages"][0])
         first_json = json.dumps(first.get("cells_data") or [], ensure_ascii=False, indent=2)
 
+        page_range_str = f"trang {int(page_from)}–{int(page_to)}" if page_to else f"từ trang {int(page_from)}"
         info = (
             f"**File:** `{Path(path).name}`  \n"
-            f"**Pages:** {len(results)}  |  "
-            f"**Elements:** {len(all_cells)}  |  "
-            f"**Model:** `{model_name}` @ `{server_url}`  \n"
+            f"**Pages parsed:** {len(results)} ({page_range_str})  |  "
+            f"**Elements:** {len(all_cells)}  \n"
+            f"**Model:** `{model_name}` @ `{server_url}`  |  "
             f"**Prompt:** `{prompt_mode}`"
         )
 
-        # Build download zip
         zip_path = os.path.join(temp_dir, f"results_{uuid.uuid4().hex[:6]}.zip")
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for root, _, files in os.walk(temp_dir):
@@ -239,20 +257,21 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
             f"1 / {len(results)}", first_json, state,
         )
 
-    except Exception as exc:
+    except (MemoryError, Exception) as exc:
         import traceback; traceback.print_exc()
         err = str(exc)
-        if "Connection refused" in err or "connect" in err.lower():
+        if "malloc" in err or isinstance(exc, MemoryError):
             msg = (
-                f"⚠️ **Cannot connect to server** at `{server_url}`\n\n"
-                "**Nếu dùng Colab:** Hãy chắc chắn notebook Colab đang chạy và dán đúng ngrok URL.\n\n"
-                "**Nếu chạy local:** Start vLLM server trước:\n"
-                "```bash\n"
-                f"vllm serve ./weights/DotsOCR \\\n"
-                f"    --tensor-parallel-size 1 \\\n"
-                f"    --served-model-name {model_name} \\\n"
-                f"    --trust-remote-code\n"
-                "```"
+                "❌ **Lỗi bộ nhớ (MemoryError)** — PDF quá lớn để render.\n\n"
+                "**Cách xử lý:**\n"
+                "1. Mở **🔧 Advanced** → kéo **PDF render DPI** xuống (thử `100` hoặc `72`)\n"
+                "2. Giới hạn số trang trong **Page range** (VD: trang 1–10, rồi 11–20...)\n"
+                "3. Bấm Parse lại"
+            )
+        elif "Connection refused" in err or "connect" in err.lower() or "APIConnection" in err:
+            msg = (
+                f"⚠️ **Không kết nối được server** tại `{server_url}`\n\n"
+                "Hãy chắc chắn Colab đang chạy và URL ngrok còn hiệu lực."
             )
         else:
             msg = f"❌ Error: {err}"
@@ -352,9 +371,14 @@ with gr.Blocks(title="dots.ocr") as demo:
             with gr.Accordion("🔧 Advanced", open=False):
                 dpi = gr.Slider(
                     label="PDF render DPI",
-                    minimum=72, maximum=200, step=1, value=150,
-                    info="Giảm DPI nếu bị lỗi MemoryError với PDF lớn (150→100→72)",
+                    minimum=48, maximum=200, step=1, value=150,
+                    info="Giảm DPI nếu bị lỗi bộ nhớ (150 → 100 → 72 → 48)",
                 )
+                with gr.Row():
+                    page_from = gr.Number(label="Trang bắt đầu", value=1, precision=0, minimum=1,
+                                          info="Trang đầu cần parse")
+                    page_to   = gr.Number(label="Trang kết thúc", value=10, precision=0, minimum=1,
+                                          info="Để trống = hết file")
                 min_px = gr.Number(label="Min pixels", value=MIN_PIXELS, precision=0)
                 max_px = gr.Number(label="Max pixels", value=MAX_PIXELS, precision=0)
 
@@ -424,7 +448,7 @@ with gr.Blocks(title="dots.ocr") as demo:
     parse_btn.click(
         run_parse,
         inputs=[file_input, demo_file, prompt_mode, custom_prompt,
-                server_url, model_name, dpi, min_px, max_px, state],
+                server_url, model_name, dpi, page_from, page_to, min_px, max_px, state],
         outputs=[preview_img, info_md, md_rendered, md_raw,
                  download_btn, page_info, json_out, state],
     )
