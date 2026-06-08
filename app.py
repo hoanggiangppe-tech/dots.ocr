@@ -7,11 +7,14 @@ import os
 import json
 import shutil
 import tempfile
+import threading
+import time
 import uuid
 import zipfile
 from pathlib import Path
 from urllib.parse import urlparse
 
+import requests as _requests
 import gradio as gr
 from PIL import Image
 
@@ -308,6 +311,31 @@ def on_demo_select(path, state):
     return load_file(path, state)
 
 
+def check_connection(server_url):
+    if not server_url or not server_url.strip():
+        return _conn_html("gray", "— Chưa nhập URL")
+    url = server_url.strip().rstrip("/")
+    try:
+        r = _requests.get(f"{url}/v1/models", timeout=5)
+        if r.status_code == 200:
+            models = [m.get("id", "?") for m in r.json().get("data", [])]
+            label = ", ".join(models) if models else "connected"
+            return _conn_html("green", f"✅ Đã kết nối — model: {label}")
+        return _conn_html("orange", f"⚠️ HTTP {r.status_code}")
+    except Exception as e:
+        msg = str(e)
+        if "Connection refused" in msg or "connect" in msg.lower():
+            return _conn_html("red", "❌ Server chưa khởi động hoặc URL sai")
+        return _conn_html("red", f"❌ {msg[:80]}")
+
+
+def _conn_html(color, text):
+    colors = {"green": "#1a7a2e", "red": "#c0392b", "orange": "#d35400", "gray": "#666"}
+    bg = {"green": "#d4edda", "red": "#fde8e8", "orange": "#fef3cd", "gray": "#f0f0f0"}
+    c, b = colors.get(color, "#666"), bg.get(color, "#f0f0f0")
+    return f'<div style="padding:6px 10px;border-radius:6px;background:{b};color:{c};font-size:13px">{text}</div>'
+
+
 # ── UI ────────────────────────────────────────────────────────────────────────
 
 CSS = """
@@ -364,9 +392,11 @@ with gr.Blocks(title="dots.ocr") as demo:
                 server_url = gr.Textbox(
                     label="Server URL",
                     value="http://127.0.0.1:8000",
-                    info="Local: http://127.0.0.1:8000  |  Colab/ngrok: https://xxxx.ngrok-free.app",
+                    info="Local: http://127.0.0.1:8000  |  Kaggle/ngrok: https://xxxx.ngrok-free.app",
                 )
                 model_name = gr.Textbox(label="Model name", value="model")
+                conn_status = gr.HTML(_conn_html("gray", "— Chưa kiểm tra"))
+                test_conn_btn = gr.Button("🔌 Test Connection", size="sm")
 
             with gr.Accordion("🔧 Advanced", open=False):
                 dpi = gr.Slider(
@@ -433,6 +463,10 @@ with gr.Blocks(title="dots.ocr") as demo:
     # ── Event wiring ──────────────────────────────────────────────────────────
 
     prompt_mode.change(on_prompt_change, inputs=prompt_mode, outputs=custom_prompt)
+
+    test_conn_btn.click(check_connection, inputs=server_url, outputs=conn_status)
+    server_url.change(check_connection, inputs=server_url, outputs=conn_status)
+    demo.load(check_connection, inputs=server_url, outputs=conn_status)
 
     file_input.upload(load_file, inputs=[file_input, state],
                       outputs=[preview_img, page_info, state])
