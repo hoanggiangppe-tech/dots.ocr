@@ -263,10 +263,10 @@ class KaggleClient:
             'dataset_data_sources': [],
             'kernel_data_sources': [],
         }
-        r = self._post('/kernels/push', files={
-            'blob': (None, json.dumps({'metadata': meta, 'blob': script_content})),
-        })
-        return r.json() if r.ok else {'error': r.text}
+        r = self._post('/kernels/push', json={'metadata': meta, 'blob': script_content})
+        if r.ok:
+            return r.json()
+        return {'error': f'HTTP {r.status_code}: {r.text[:300]}'}
 
     def kernel_status(self) -> str:
         r = self._get(f'/kernels/{self.username}/{KERNEL_SLUG}/status')
@@ -276,8 +276,8 @@ class KaggleClient:
 
     def test_auth(self) -> bool:
         try:
-            r = self._get('/competitions/list')
-            return r.status_code in (200, 403)
+            r = self._get(f'/kernels?userName={self.username}&pageSize=1')
+            return r.status_code in (200, 404)
         except Exception:
             return False
 
@@ -700,11 +700,21 @@ class App(tk.Tk):
 
         result = client.push_kernel(script)
         if 'error' in result:
-            self._log_msg(f'❌ Push kernel lỗi: {result["error"]}')
-            self._set_badge('❌ Lỗi', '#f38ba8')
+            err = result['error']
+            self._log_msg(f'❌ Push kernel lỗi: {err}')
+            if '401' in err or 'Unauthorized' in err:
+                self._log_msg('   → Sai username/API key hoặc tài khoản chưa xác minh SĐT trên Kaggle')
+            elif '403' in err or 'Forbidden' in err:
+                self._log_msg('   → Tài khoản chưa bật Internet/GPU — vào kaggle.com kiểm tra Settings')
+            elif '400' in err:
+                self._log_msg('   → Dữ liệu gửi sai định dạng — liên hệ hỗ trợ')
+            self._set_badge('❌ Lỗi push', '#f38ba8')
+            self.after(0, lambda e=err: messagebox.showerror(
+                'Push kernel thất bại', e[:400], parent=self))
             return
 
-        self._log_msg(f'✅ Kernel đã push — đang chờ khởi động (~10 phút)...')
+        ref = result.get('ref', '')
+        self._log_msg(f'✅ Kernel đã push (ref: {ref}) — đang chờ khởi động (~10 phút)...')
         self._set_badge('⏳ Kaggle đang cài đặt...', '#f9e2af')
 
         # Chờ URL xuất hiện trên relay
