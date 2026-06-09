@@ -3,6 +3,7 @@ dots.ocr - Local Web Interface
 Connects to a vLLM server for document/image OCR and layout parsing.
 """
 
+import hashlib
 import os
 import json
 import shutil
@@ -65,6 +66,9 @@ if os.path.exists(DEMO_IMAGES_DIR):
         if p.suffix.lower() in exts
     )
 
+RESULTS_DIR = Path.home() / ".dots_ocr_manager" / "results"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def make_session():
@@ -103,6 +107,34 @@ def build_parser(server_url, model_name, temperature, dpi=150):
         temperature=float(temperature),
         dpi=int(dpi),
         output_dir=tempfile.mkdtemp(prefix="dotsocr_"),
+    )
+
+
+def _stable_output_dir(file_path: str, prompt_mode: str, start_page: int) -> Path:
+    key = hashlib.md5(
+        f"{os.path.abspath(file_path)}:{prompt_mode}:{start_page}".encode()
+    ).hexdigest()[:10]
+    d = RESULTS_DIR / f"{Path(file_path).stem}_{key}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _load_checkpoint(stable_dir: Path) -> dict:
+    cp = stable_dir / "checkpoint.json"
+    if cp.exists():
+        try:
+            return json.loads(cp.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_page_checkpoint(stable_dir: Path, checkpoint: dict, page_key: str, result: dict):
+    serializable = {k: v for k, v in result.items()
+                    if isinstance(v, (str, int, float, bool, type(None)))}
+    checkpoint[page_key] = serializable
+    (stable_dir / "checkpoint.json").write_text(
+        json.dumps(checkpoint, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
 
@@ -182,7 +214,6 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
         fname = Path(path).stem
 
         if ext == ".pdf":
-            # Load page by page to avoid bulk memory usage
             start = max(0, int(page_from) - 1)
             end   = int(page_to) - 1 if page_to else None
             try:
@@ -193,15 +224,50 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
                     raise MemoryError(str(mem_exc))
                 raise
 
+            # Use stable dir so checkpoint survives app restarts
+            stable_dir = _stable_output_dir(path, prompt_mode, start)
+            checkpoint = _load_checkpoint(stable_dir)
+            skipped_cp = 0
+
             results = []
             for i, img in enumerate(pages):
                 page_no = start + i
-                r = parser._parse_single_image(
-                    img, prompt_mode, temp_dir,
-                    fname, source="pdf", page_idx=page_no,
-                )
-                r["file_path"] = path
-                results.append(r)
+                page_key = str(page_no)
+
+                # Resume from checkpoint if page already done
+                if page_key in checkpoint:
+                    cp_r = checkpoint[page_key]
+                    md_p = cp_r.get("md_content_path") or cp_r.get("md_content_nohf_path")
+                    if md_p and os.path.exists(md_p):
+                        results.append(cp_r)
+                        skipped_cp += 1
+                        continue
+
+                # Retry up to 3x with backoff (handles transient ngrok errors)
+                last_err = None
+                for attempt in range(3):
+                    try:
+                        r = parser._parse_single_image(
+                            img, prompt_mode, str(stable_dir),
+                            fname, source="pdf", page_idx=page_no,
+                        )
+                        r["file_path"] = path
+                        _save_page_checkpoint(stable_dir, checkpoint, page_key, r)
+                        results.append(r)
+                        last_err = None
+                        break
+                    except Exception as e:
+                        last_err = e
+                        if attempt < 2:
+                            time.sleep(10 * (attempt + 1))
+
+                if last_err is not None:
+                    done = len(results)
+                    raise RuntimeError(
+                        f"❌ Trang {page_no + 1} thất bại sau 3 lần thử: {last_err}\n\n"
+                        f"Đã xử lý **{done}/{len(pages)} trang** — kết quả đã lưu.\n"
+                        f"▶ Chạy lại với cùng file + cùng cài đặt để **tiếp tục từ trang {page_no + 1}**."
+                    )
         else:
             results = parser.parse_image(path, fname, prompt_mode, temp_dir,
                                          fitz_preprocess=fitz_pre)
@@ -251,21 +317,28 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
         first_json = json.dumps(first.get("cells_data") or [], ensure_ascii=False, indent=2)
 
         page_range_str = f"trang {int(page_from)}–{int(page_to)}" if page_to else f"từ trang {int(page_from)}"
+        resume_note = (
+            f"  \n**Resume:** {skipped_cp} trang từ cache, {len(results) - skipped_cp} trang mới xử lý"
+            if ext == ".pdf" and skipped_cp > 0 else ""
+        )
         info = (
             f"**File:** `{Path(path).name}`  \n"
             f"**Pages parsed:** {len(results)} ({page_range_str})  |  "
-            f"**Elements:** {len(all_cells)}  \n"
+            f"**Elements:** {len(all_cells)}{resume_note}  \n"
             f"**Model:** `{model_name}` @ `{server_url}`  |  "
             f"**Prompt:** `{prompt_mode}`"
         )
 
+        # For PDFs use stable_dir (persistent), for images use temp_dir
+        zip_source = str(stable_dir) if ext == ".pdf" else temp_dir
         zip_path = os.path.join(temp_dir, f"results_{uuid.uuid4().hex[:6]}.zip")
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for root, _, files in os.walk(temp_dir):
+            for root, _, files in os.walk(zip_source):
                 for fn in files:
-                    if not fn.endswith(".zip"):
-                        full = os.path.join(root, fn)
-                        zf.write(full, os.path.relpath(full, temp_dir))
+                    if fn == "checkpoint.json" or fn.endswith(".zip"):
+                        continue
+                    full = os.path.join(root, fn)
+                    zf.write(full, os.path.relpath(full, zip_source))
 
         return (
             first_img, info, combined_md, combined_md,
