@@ -35,15 +35,18 @@ def inference_with_vllm(
         }
     )
     try:
-        response = client.chat.completions.create(
-            messages=messages, 
-            model=model_name, 
+        resp = client.chat.completions.create(
+            messages=messages,
+            model=model_name,
             max_completion_tokens=max_completion_tokens,
             temperature=temperature,
-            top_p=top_p)
-        response = response.choices[0].message.content
-        return response
-    except requests.exceptions.RequestException as e:
-        print(f"request error: {e}")
-        return None
+            top_p=top_p,
+        )
+        content = resp.choices[0].message.content
+        if not content:
+            raise ValueError(f"vLLM trả về nội dung rỗng (model: {model_name})")
+        return content
+    except Exception as e:
+        print(f"inference error: {e}")
+        raise RuntimeError(f"Lỗi kết nối vLLM: {e}") from e
 

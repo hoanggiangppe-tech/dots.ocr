@@ -233,6 +233,19 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
         state["parsed_pages"] = parsed_pages
 
         combined_md = "\n\n---\n\n".join(all_md)
+
+        if not combined_md.strip():
+            return (
+                None,
+                "⚠️ **Server trả về nội dung rỗng.**\n\n"
+                "Kiểm tra:\n"
+                "1. Model name trong **Server Config** phải là `model`\n"
+                "2. vLLM đã sẵn sàng chưa (Cell 4b log `✅ vLLM sẵn sàng`)\n"
+                "3. Thử **🔌 Test Connection** — nếu xanh thì server OK\n"
+                "4. Chạy lại Cell 4b trên Kaggle nếu server mới restart",
+                "", "", gr.update(visible=False), "0 / 0", "", state,
+            )
+
         first = parsed_pages[0]
         first_img = first["layout_image"] or (Image.open(path) if ext != ".pdf" else state["pages"][0])
         first_json = json.dumps(first.get("cells_data") or [], ensure_ascii=False, indent=2)
