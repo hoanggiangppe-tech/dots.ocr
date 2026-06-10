@@ -5,10 +5,10 @@ import os
 if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument('--type', '-t', type=str, default="huggingface")
-    parser.add_argument('--name', '-n', type=str, default="rednote-hilab/dots.mocr")
+    parser.add_argument('--name', '-n', type=str, default="kristaller486/dots.ocr-1.5")
     args = parser.parse_args()
     script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    print(f"Attention: The model save dir dots.mocr should be replace by a name without `.` like DotsMOCR, util we merge our code to transformers.")
+    print(f"Downloading model: {args.name}")
     model_dir = os.path.join(script_dir, "weights/DotsMOCR")
     if not os.path.exists(model_dir):
         os.makedirs(model_dir)
@@ -20,5 +20,5 @@ if __name__ == '__main__':
         snapshot_download(repo_id=args.name, local_dir=model_dir)
     else:
         raise ValueError(f"Invalid type: {args.type}")
-    
+
     print(f"model downloaded to {model_dir}")
