@@ -196,14 +196,19 @@ def navigate(direction, state):
 
 
 def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
-              server_url, model_name, dpi, page_from, page_to, min_px, max_px, state):
+              server_url, model_name, dpi, page_from, page_to, min_px, max_px, state,
+              progress=gr.Progress()):
+    """Generator: yields partial info_md updates each page, then final full result."""
+
+    _NO_CHANGE = gr.update()  # sentinel: leave component unchanged
 
     path = file_input or demo_file
     if not path or not os.path.exists(str(path)):
-        return (
+        yield (
             None, "⚠️ Please upload a file or select a demo image.",
             "", "", gr.update(visible=False), "0 / 0", "", state,
         )
+        return
 
     # Cleanup previous temp dir
     if state.get("temp_dir") and os.path.exists(state["temp_dir"]):
@@ -218,6 +223,8 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
     _original_general = dict_promptmode_to_prompt.get("prompt_general", " ")
     if prompt_mode == "prompt_general" and custom_prompt.strip():
         dict_promptmode_to_prompt["prompt_general"] = custom_prompt.strip()
+
+    stable_dir = None  # set below for PDFs
 
     try:
         parser = build_parser(server_url, model_name, temperature, dpi)
@@ -245,6 +252,9 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
                     page_no = start + i
                     page_key = str(page_no)
 
+                    # Update progress bar
+                    progress(i / total_pages, desc=f"Trang {page_no + 1} / {end + 1}")
+
                     # Resume from checkpoint if page already done
                     if page_key in checkpoint:
                         cp_r = checkpoint[page_key]
@@ -252,7 +262,21 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
                         if md_p and os.path.exists(md_p):
                             results.append(cp_r)
                             skipped_cp += 1
+                            yield (
+                                _NO_CHANGE,
+                                f"⏩ Trang **{page_no + 1} / {end + 1}** — từ cache ✅"
+                                f"&nbsp;&nbsp;`{i + 1}/{total_pages} xong`",
+                                _NO_CHANGE, _NO_CHANGE, _NO_CHANGE, _NO_CHANGE, _NO_CHANGE, state,
+                            )
                             continue
+
+                    # Live status before OCR starts on this page
+                    yield (
+                        _NO_CHANGE,
+                        f"⏳ Đang OCR trang **{page_no + 1} / {end + 1}**…"
+                        f"&nbsp;&nbsp;`{i}/{total_pages} hoàn thành`",
+                        _NO_CHANGE, _NO_CHANGE, _NO_CHANGE, _NO_CHANGE, _NO_CHANGE, state,
+                    )
 
                     # Load single page on demand
                     img = _fitz_to_img(_pdf[page_no], target_dpi=int(dpi))
@@ -273,6 +297,11 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
                         except Exception as e:
                             last_err = e
                             if attempt < 2:
+                                yield (
+                                    _NO_CHANGE,
+                                    f"🔄 Trang **{page_no + 1}** lỗi lần {attempt + 1}/3 — thử lại sau {10*(attempt+1)}s…",
+                                    _NO_CHANGE, _NO_CHANGE, _NO_CHANGE, _NO_CHANGE, _NO_CHANGE, state,
+                                )
                                 time.sleep(10 * (attempt + 1))
 
                     del img  # free page memory immediately
@@ -284,7 +313,15 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
                             f"Đã xử lý **{done}/{total_pages} trang** — kết quả đã lưu.\n"
                             f"▶ Chạy lại với cùng file + cùng cài đặt để **tiếp tục từ trang {page_no + 1}**."
                         )
+
+            progress(1.0, desc="Hoàn thành!")
+
         else:
+            yield (
+                _NO_CHANGE,
+                "⏳ Đang xử lý ảnh…",
+                _NO_CHANGE, _NO_CHANGE, _NO_CHANGE, _NO_CHANGE, _NO_CHANGE, state,
+            )
             results = parser.parse_image(path, fname, prompt_mode, temp_dir,
                                          fitz_preprocess=fitz_pre)
 
@@ -317,7 +354,7 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
         combined_md = "\n\n---\n\n".join(all_md)
 
         if not combined_md.strip():
-            return (
+            yield (
                 None,
                 "⚠️ **Server trả về nội dung rỗng.**\n\n"
                 "Kiểm tra:\n"
@@ -327,6 +364,7 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
                 "4. Chạy lại Cell 4b trên Kaggle nếu server mới restart",
                 "", "", gr.update(visible=False), "0 / 0", "", state,
             )
+            return
 
         first = parsed_pages[0]
         first_img = first["layout_image"] or (Image.open(path) if ext != ".pdf" else state["pages"][0])
@@ -356,7 +394,7 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
                     full = os.path.join(root, fn)
                     zf.write(full, os.path.relpath(full, zip_source))
 
-        return (
+        yield (
             first_img, info, combined_md, combined_md,
             gr.update(value=zip_path, visible=True),
             f"1 / {len(results)}", first_json, state,
@@ -380,7 +418,7 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
             )
         else:
             msg = f"❌ Error: {err}"
-        return (None, msg, "", "", gr.update(visible=False), "0 / 0", "", state)
+        yield (None, msg, "", "", gr.update(visible=False), "0 / 0", "", state)
     finally:
         dict_promptmode_to_prompt["prompt_general"] = _original_general
 
