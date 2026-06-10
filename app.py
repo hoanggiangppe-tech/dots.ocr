@@ -225,6 +225,7 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
         dict_promptmode_to_prompt["prompt_general"] = custom_prompt.strip()
 
     stable_dir = None  # set below for PDFs
+    results = []       # populated inside try; readable in except for partial display
 
     try:
         parser = build_parser(server_url, model_name, temperature, dpi)
@@ -418,7 +419,47 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
             )
         else:
             msg = f"❌ Error: {err}"
-        yield (None, msg, "", "", gr.update(visible=False), "0 / 0", "", state)
+
+        # Collect partial results from pages that were already successfully parsed
+        partial_parsed = []
+        partial_md_parts = []
+        for r in results:
+            pr = {"layout_image": None, "cells_data": None, "md": ""}
+            if r.get("layout_image_path") and os.path.exists(r["layout_image_path"]):
+                try:
+                    pr["layout_image"] = Image.open(r["layout_image_path"])
+                except Exception:
+                    pass
+            md_path = r.get("md_content_path") or r.get("md_content_nohf_path")
+            if md_path and os.path.exists(md_path):
+                try:
+                    with open(md_path, encoding="utf-8") as f:
+                        pr["md"] = f.read()
+                    partial_md_parts.append(pr["md"])
+                except Exception:
+                    pass
+            partial_parsed.append(pr)
+
+        partial_md = "\n\n---\n\n".join(partial_md_parts)
+
+        if partial_md:
+            state["pages"] = [p.get("layout_image") for p in partial_parsed]
+            state["page_idx"] = 0
+            state["is_parsed"] = True
+            state["parsed_pages"] = partial_parsed
+            first_img = partial_parsed[0].get("layout_image") if partial_parsed else None
+            full_msg = (
+                f"{msg}\n\n"
+                f"---\n\n"
+                f"**Kết quả {len(partial_parsed)} trang đã xử lý trước khi bị ngắt:**"
+            )
+            yield (
+                first_img, full_msg, partial_md, partial_md,
+                gr.update(visible=False),
+                f"1 / {len(partial_parsed)}", "", state,
+            )
+        else:
+            yield (None, msg, "", "", gr.update(visible=False), "0 / 0", "", state)
     finally:
         dict_promptmode_to_prompt["prompt_general"] = _original_general
 
