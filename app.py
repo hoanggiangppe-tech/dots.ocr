@@ -22,7 +22,8 @@ from PIL import Image
 from dots_ocr.parser import DotsOCRParser
 from dots_ocr.utils import dict_promptmode_to_prompt
 from dots_ocr.utils.consts import MIN_PIXELS, MAX_PIXELS
-from dots_ocr.utils.doc_utils import load_images_from_pdf
+import fitz as _fitz
+from dots_ocr.utils.doc_utils import load_images_from_pdf, fitz_doc_to_image as _fitz_to_img
 from dots_ocr.utils.image_utils import fetch_image
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -144,17 +145,24 @@ def load_file(file_path, state):
 
     ext = Path(file_path).suffix.lower()
     if ext == ".pdf":
-        pages = load_images_from_pdf(file_path, dpi=150)
+        with _fitz.open(file_path) as _doc:
+            total = _doc.page_count
+            first_img = _fitz_to_img(_doc[0], target_dpi=100)
+        # Lazy placeholders — pages loaded on demand to avoid OOM on large PDFs
+        state["pages"] = [first_img] + [None] * (total - 1)
+        state["pdf_path"] = file_path
     elif ext in {".jpg", ".jpeg", ".png"}:
-        pages = [Image.open(file_path).convert("RGB")]
+        first_img = Image.open(file_path).convert("RGB")
+        state["pages"] = [first_img]
+        state["pdf_path"] = None
     else:
         return None, "Unsupported format", state
 
-    state["pages"] = pages
     state["page_idx"] = 0
     state["is_parsed"] = False
     state["parsed_pages"] = []
-    return pages[0], f"1 / {len(pages)}", state
+    total = len(state["pages"])
+    return first_img, f"1 / {total}", state
 
 
 def navigate(direction, state):
@@ -170,6 +178,12 @@ def navigate(direction, state):
     state["page_idx"] = idx
 
     img = pages[idx]
+    # Lazy-load from PDF if placeholder (avoids loading all pages at once)
+    if img is None and state.get("pdf_path"):
+        with _fitz.open(state["pdf_path"]) as _doc:
+            img = _fitz_to_img(_doc[idx], target_dpi=100)
+        pages[idx] = img  # cache for repeat navigation
+
     if state["is_parsed"] and idx < len(state["parsed_pages"]):
         r = state["parsed_pages"][idx]
         if r.get("layout_image"):
@@ -215,59 +229,61 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
 
         if ext == ".pdf":
             start = max(0, int(page_from) - 1)
-            end   = int(page_to) - 1 if page_to else None
-            try:
-                pages = load_images_from_pdf(path, dpi=int(dpi),
-                                             start_page_id=start, end_page_id=end)
-            except Exception as mem_exc:
-                if "malloc" in str(mem_exc) or "MemoryError" in str(type(mem_exc)):
-                    raise MemoryError(str(mem_exc))
-                raise
+            with _fitz.open(path) as _count_doc:
+                end = (int(page_to) - 1) if page_to else (_count_doc.page_count - 1)
+                total_pages = end - start + 1
 
             # Use stable dir so checkpoint survives app restarts
             stable_dir = _stable_output_dir(path, prompt_mode, start)
             checkpoint = _load_checkpoint(stable_dir)
             skipped_cp = 0
-
             results = []
-            for i, img in enumerate(pages):
-                page_no = start + i
-                page_key = str(page_no)
 
-                # Resume from checkpoint if page already done
-                if page_key in checkpoint:
-                    cp_r = checkpoint[page_key]
-                    md_p = cp_r.get("md_content_path") or cp_r.get("md_content_nohf_path")
-                    if md_p and os.path.exists(md_p):
-                        results.append(cp_r)
-                        skipped_cp += 1
-                        continue
+            # Open PDF once and load one page at a time — avoids OOM on large PDFs
+            with _fitz.open(path) as _pdf:
+                for i in range(total_pages):
+                    page_no = start + i
+                    page_key = str(page_no)
 
-                # Retry up to 3x with backoff (handles transient ngrok errors)
-                last_err = None
-                for attempt in range(3):
-                    try:
-                        r = parser._parse_single_image(
-                            img, prompt_mode, str(stable_dir),
-                            fname, source="pdf", page_idx=page_no,
+                    # Resume from checkpoint if page already done
+                    if page_key in checkpoint:
+                        cp_r = checkpoint[page_key]
+                        md_p = cp_r.get("md_content_path") or cp_r.get("md_content_nohf_path")
+                        if md_p and os.path.exists(md_p):
+                            results.append(cp_r)
+                            skipped_cp += 1
+                            continue
+
+                    # Load single page on demand
+                    img = _fitz_to_img(_pdf[page_no], target_dpi=int(dpi))
+
+                    # Retry up to 3x with backoff (handles transient ngrok errors)
+                    last_err = None
+                    for attempt in range(3):
+                        try:
+                            r = parser._parse_single_image(
+                                img, prompt_mode, str(stable_dir),
+                                fname, source="pdf", page_idx=page_no,
+                            )
+                            r["file_path"] = path
+                            _save_page_checkpoint(stable_dir, checkpoint, page_key, r)
+                            results.append(r)
+                            last_err = None
+                            break
+                        except Exception as e:
+                            last_err = e
+                            if attempt < 2:
+                                time.sleep(10 * (attempt + 1))
+
+                    del img  # free page memory immediately
+
+                    if last_err is not None:
+                        done = len(results)
+                        raise RuntimeError(
+                            f"❌ Trang {page_no + 1} thất bại sau 3 lần thử: {last_err}\n\n"
+                            f"Đã xử lý **{done}/{total_pages} trang** — kết quả đã lưu.\n"
+                            f"▶ Chạy lại với cùng file + cùng cài đặt để **tiếp tục từ trang {page_no + 1}**."
                         )
-                        r["file_path"] = path
-                        _save_page_checkpoint(stable_dir, checkpoint, page_key, r)
-                        results.append(r)
-                        last_err = None
-                        break
-                    except Exception as e:
-                        last_err = e
-                        if attempt < 2:
-                            time.sleep(10 * (attempt + 1))
-
-                if last_err is not None:
-                    done = len(results)
-                    raise RuntimeError(
-                        f"❌ Trang {page_no + 1} thất bại sau 3 lần thử: {last_err}\n\n"
-                        f"Đã xử lý **{done}/{len(pages)} trang** — kết quả đã lưu.\n"
-                        f"▶ Chạy lại với cùng file + cùng cài đặt để **tiếp tục từ trang {page_no + 1}**."
-                    )
         else:
             results = parser.parse_image(path, fname, prompt_mode, temp_dir,
                                          fitz_preprocess=fitz_pre)
@@ -292,8 +308,8 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
                     all_md.append(pr["md"])
             parsed_pages.append(pr)
 
-        state["pages"] = [p["layout_image"] or state["pages"][i]
-                         for i, p in enumerate(parsed_pages)]
+        # Prefer layout_image; fall back to lazy placeholder (navigate will load on demand)
+        state["pages"] = [p.get("layout_image") for p in parsed_pages]
         state["page_idx"] = 0
         state["is_parsed"] = True
         state["parsed_pages"] = parsed_pages
