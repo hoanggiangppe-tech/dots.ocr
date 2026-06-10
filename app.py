@@ -254,13 +254,16 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
                     page_key = str(page_no)
 
                     # Update progress bar
-                    progress(i / total_pages, desc=f"Trang {page_no + 1} / {end + 1}")
+                    try:
+                        progress(i / total_pages, desc=f"Trang {page_no + 1} / {end + 1}")
+                    except Exception:
+                        pass
 
-                    # Resume from checkpoint if page already done
+                    # Resume from checkpoint only if page result file exists AND has content
                     if page_key in checkpoint:
                         cp_r = checkpoint[page_key]
                         md_p = cp_r.get("md_content_path") or cp_r.get("md_content_nohf_path")
-                        if md_p and os.path.exists(md_p):
+                        if md_p and os.path.exists(md_p) and os.path.getsize(md_p) > 0:
                             results.append(cp_r)
                             skipped_cp += 1
                             yield (
@@ -315,7 +318,10 @@ def run_parse(file_input, demo_file, prompt_mode, custom_prompt,
                             f"▶ Chạy lại với cùng file + cùng cài đặt để **tiếp tục từ trang {page_no + 1}**."
                         )
 
-            progress(1.0, desc="Hoàn thành!")
+            try:
+                progress(1.0, desc="Hoàn thành!")
+            except Exception:
+                pass
 
         else:
             yield (
